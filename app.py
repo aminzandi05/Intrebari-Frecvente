@@ -69,15 +69,19 @@ def page_ask():
     question = st.text_area("Întrebarea ta despre normative", height=100)
 
     if st.button("Răspunde", type="primary") and question.strip():
-        with st.spinner("Caut în documente și formulez răspunsul..."):
-            # Traducem întrebarea în termenii din normative (ex: "buton de
-            # incendiu" -> "declanșator manual"), apoi căutăm după oricare dintre ei.
-            terms = qa.expand_query(question)
-            search_q = qa.build_search_query(terms + [question]) if terms else question
-            chunks = db.search_chunks(search_q, limit=8)
-            if not chunks and terms:
-                chunks = db.search_chunks(question, limit=6)
-            answer = qa.answer_question(question, chunks)
+        with st.spinner("Caut în normative (pot fi mai multe căutări) și formulez răspunsul..."):
+            try:
+                # Claude caută singur, de mai multe ori și cu formulări diferite,
+                # până găsește fragmentele relevante, apoi răspunde.
+                answer, chunks, terms = qa.answer_with_search(question, db.search_chunks)
+            except Exception:
+                # Rezervă: o singură căutare cu termenii traduși în limbajul normativelor.
+                terms = qa.expand_query(question)
+                search_q = qa.build_search_query(terms + [question]) if terms else question
+                chunks = db.search_chunks(search_q, limit=8)
+                if not chunks and terms:
+                    chunks = db.search_chunks(question, limit=6)
+                answer = qa.answer_question(question, chunks)
 
         st.markdown("### Răspuns")
         st.write(answer)
