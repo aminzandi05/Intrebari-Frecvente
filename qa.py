@@ -143,3 +143,111 @@ def answer_question(question: str, chunks: list[dict]) -> str:
         messages=[{"role": "user", "content": user_message}],
     )
     return response.content[0].text
+
+
+# ---------------------------------------------------------------------------
+# 3) Căutare iterativă: Claude caută singur, de mai multe ori, cu formulări
+#    diferite, până găsește fragmentele relevante, apoi răspunde.
+# ---------------------------------------------------------------------------
+
+AGENT_PROMPT = """Ești un asistent expert în normativele tehnice românești pentru \
+instalații în construcții. Răspunzi la întrebări folosind EXCLUSIV fragmentele din \
+documentele încărcate de utilizator, pe care le găsești cu unealta \
+`cauta_in_normative`.
+
+Cum lucrezi:
+1. Înțelege ce vrea utilizatorul, chiar dacă folosește limbaj colocvial, de șantier, \
+abrevieri, greșeli de scriere sau o descriere indirectă ("chestia aia roșie de pe \
+perete pe care o apeși la foc" = declanșator manual de alarmare).
+2. Caută folosind TERMINOLOGIA DIN NORMATIVE: denumirea oficială, sinonime tehnice, \
+noțiuni înrudite, numele sistemului din care face parte, articolele/capitolele \
+probabile. Poți da mai mulți termeni într-o singură căutare.
+3. Dacă rezultatele nu răspund la întrebare, caută din nou cu alte formulări \
+(mai generale, mai specifice sau din alt unghi). Fă cel puțin 2 căutări diferite \
+înainte să concluzionezi că informația lipsește.
+4. Când ai fragmentele relevante, răspunde.
+
+Reguli pentru răspuns:
+- Doar pe baza fragmentelor găsite. Nu inventa și nu completa din cunoștințe generale.
+- Menționează denumirea oficială din normativ a elementului întrebat.
+- Citează articole/paragrafe/valori exacte când apar în text.
+- La final, indică documentele sursă (nume fișier).
+- Dacă după căutări informația nu apare, spune clar că nu a fost găsită în \
+documentele încărcate și menționează ce termeni ai căutat.
+- Fii precis și concis."""
+
+SEARCH_TOOL = {
+    "name": "cauta_in_normative",
+    "description": (
+        "Caută full-text în normativele încărcate. Întoarce fragmentele care conțin "
+        "oricare dintre termeni (toate cuvintele unui termen trebuie să apară în "
+        "fragment). Folosește termeni scurți (1-3 cuvinte), în limbajul normativelor."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "termeni": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Termenii de căutare, ex: [\"declanșator manual\", \"alarmare manuală\"]",
+            }
+        },
+        "required": ["termeni"],
+    },
+}
+
+MAX_SEARCHES = 6
+
+
+def answer_with_search(question: str, search_fn, limit: int = 8):
+    """Răspunde lăsând-o pe Claude să caute iterativ.
+
+    search_fn(query_string, limit) -> listă de fragmente (dict cu content,
+    filename, chunk_index). Întoarce (răspuns, fragmente_găsite, termeni_căutați).
+    """
+    client = get_client()
+    messages = [{"role": "user", "content": question}]
+    found = {}          # (filename, chunk_index) -> fragment
+    searched = []       # toți termenii încercați
+
+    for step in range(MAX_SEARCHES + 1):
+        allow_tools = step < MAX_SEARCHES
+        kwargs = dict(model=MODEL, max_tokens=2000, system=AGENT_PROMPT,
+                      messages=messages, tools=[SEARCH_TOOL])
+        if not allow_tools:
+            # ultima tură: nu mai are voie să caute, răspunde cu ce a găsit
+            kwargs["tool_choice"] = {"type": "none"}
+            messages[-1]["content"].append({
+                "type": "text",
+                "text": "Ai atins limita de căutări. Răspunde acum pe baza fragmentelor găsite.",
+            })
+        response = client.messages.create(**kwargs)
+
+        tool_calls = [b for b in response.content if b.type == "tool_use"]
+        if response.stop_reason != "tool_use" or not tool_calls:
+            text = "".join(b.text for b in response.content if b.type == "text").strip()
+            return text, list(found.values()), searched
+
+        messages.append({"role": "assistant", "content": response.content})
+        results = []
+        for call in tool_calls:
+            terms = [t for t in call.input.get("termeni", []) if isinstance(t, str)]
+            searched.extend(terms)
+            query = build_search_query(terms)
+            chunks = search_fn(query, limit) if query else []
+            parts = []
+            for c in chunks:
+                key = (c["filename"], c["chunk_index"])
+                if key in found:
+                    parts.append(f"--- {c['filename']} (fragment #{c['chunk_index']}) --- [deja primit mai sus]")
+                else:
+                    found[key] = c
+                    parts.append(f"--- {c['filename']} (fragment #{c['chunk_index']}) ---\n{c['content']}")
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": call.id,
+                "content": "\n\n".join(parts) if parts else "Niciun fragment găsit pentru acești termeni.",
+            })
+        messages.append({"role": "user", "content": results})
+
+    return "Nu am putut formula un răspuns.", list(found.values()), searched
