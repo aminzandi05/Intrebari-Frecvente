@@ -14,6 +14,11 @@ def get_engine():
     global _engine
     if _engine is None:
         db_url = st.secrets["DATABASE_URL"]
+        # Forțăm driverul psycopg (v3), indiferent de prefixul din secrets.
+        for prefix in ("postgresql+psycopg2://", "postgresql://", "postgres://"):
+            if db_url.startswith(prefix):
+                db_url = "postgresql+psycopg://" + db_url[len(prefix):]
+                break
         # NullPool: Streamlit Cloud repornește frecvent procesele; evităm
         # conexiuni "moarte" păstrate în pool între rerun-uri.
         _engine = create_engine(db_url, poolclass=NullPool, pool_pre_ping=True)
